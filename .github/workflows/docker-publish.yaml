@@ -23,6 +23,15 @@ jobs:
         with:
           cosign-release: "v2.2.4"
 
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@f0ec1fc3b38f5e7cd731bb6ce540c5af426746bb # v6.1.0
+        with:
+          enable-cache: true
+          prune-cache: false
+
+      # Generate the requirements file as input for the docker image creation
+      - run: uv export --no-default-groups --locked -o requirements.txt
+
       # Set up BuildKit Docker container builder to be able to build
       # multi-platform images and export cache
       # https://github.com/docker/setup-buildx-action
