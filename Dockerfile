@@ -2,10 +2,8 @@ FROM python:3.11-slim@sha256:316d89b74c4d467565864be703299878ca7a97893ed44ae45f6
 COPY . /app
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --require-hashes --no-cache-dir -r requirements.txt
-
 COPY . .
+RUN pip install --require-hashes --no-cache-dir -r requirements.txt
 RUN pip install --no-deps --no-cache-dir .
 
 

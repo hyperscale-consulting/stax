@@ -30,7 +30,7 @@ jobs:
           prune-cache: false
 
       # Generate the requirements file as input for the docker image creation
-      - run: uv export --no-default-groups --locked -o requirements.txt
+      - run: uv export --no-default-groups --no-emit-local --locked -o requirements.txt
 
       # Set up BuildKit Docker container builder to be able to build
       # multi-platform images and export cache
