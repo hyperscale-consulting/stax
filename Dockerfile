@@ -15,4 +15,3 @@ COPY --from=build-env /usr/local/bin/stax /usr/local/bin/stax
 ENV PYTHONPATH=/usr/local/lib/python3.11/site-packages
 WORKDIR /app
 ENTRYPOINT ["python", "/usr/local/bin/stax"]
-
