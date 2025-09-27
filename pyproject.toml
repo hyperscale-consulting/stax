@@ -1,6 +1,6 @@
 [project]
-name = "stax"
-version = "0.1.4"
+name = "hyperscale-stax"
+version = "0.1.5"
 description = "Deploy Cloudformation stack sets"
 readme = "README.md"
 requires-python = ">=3.10"

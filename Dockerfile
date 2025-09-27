@@ -5,10 +5,10 @@ ARG VERSION
 WORKDIR /app
 
 COPY ./requirements.txt .
-COPY ./dist/stax-$VERSION-py3-none-any.whl .
+COPY ./dist/hyperscale_stax-$VERSION-py3-none-any.whl .
 
 RUN pip install --require-hashes --no-cache-dir --prefix /app/packages -r requirements.txt
-RUN pip install --no-deps --no-cache-dir --prefix /app/packages stax-$VERSION-py3-none-any.whl
+RUN pip install --no-deps --no-cache-dir --prefix /app/packages hyperscale_stax-$VERSION-py3-none-any.whl
 
 FROM python:3.13-alpine@sha256:527c28b29498575b851ad88e7522ac7201bbd9e920d2c11b00ff2b39b315f5f8
 
