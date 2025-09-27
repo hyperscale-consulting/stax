@@ -1,15 +1,26 @@
-FROM python:3.11-slim@sha256:316d89b74c4d467565864be703299878ca7a97893ed44ae45f6acba5af09d154 AS build-env
-COPY . /app
+FROM python:3.13-alpine@sha256:527c28b29498575b851ad88e7522ac7201bbd9e920d2c11b00ff2b39b315f5f8 AS builder
+
+ARG VERSION
+
 WORKDIR /app
 
-COPY . .
-RUN pip install --require-hashes --no-cache-dir -r requirements.txt
-RUN pip install --no-deps --no-cache-dir .
+COPY ./requirements.txt .
+COPY ./dist/stax-$VERSION-py3-none-any.whl .
 
+RUN pip install --require-hashes --no-cache-dir --prefix /app/packages -r requirements.txt
+RUN pip install --no-deps --no-cache-dir --prefix /app/packages stax-$VERSION-py3-none-any.whl
 
-FROM gcr.io/distroless/python3-debian12:nonroot@sha256:ea332530bc348c9cb4d9aeb7cdfde2a8c7c52bff1abff0e098452ff68f0eb86e
-COPY --from=build-env /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=build-env /usr/local/bin/stax /usr/local/bin/stax
-ENV PYTHONPATH=/usr/local/lib/python3.11/site-packages
+FROM python:3.13-alpine@sha256:527c28b29498575b851ad88e7522ac7201bbd9e920d2c11b00ff2b39b315f5f8
+
 WORKDIR /app
-ENTRYPOINT ["python", "/usr/local/bin/stax"]
+
+COPY --from=builder /app/packages /app/packages
+ENV PYTHONPATH=/app/packages/lib/python3.13/site-packages
+
+RUN addgroup -g 1001 -S appgroup && \
+  adduser -S appuser -u 1001 -G appgroup && \
+  chown -R appuser:appgroup /app
+
+USER appuser
+
+ENTRYPOINT ["/app/packages/bin/stax"]
