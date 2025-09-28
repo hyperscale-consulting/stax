@@ -16,6 +16,7 @@ WORKDIR /app
 
 COPY --from=builder /app/packages /app/packages
 ENV PYTHONPATH=/app/packages/lib/python3.13/site-packages
+ENV PATH="/app/packages/bin:${PATH}"
 
 RUN addgroup -g 1001 -S appgroup && \
   adduser -S appuser -u 1001 -G appgroup && \
