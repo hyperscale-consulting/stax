@@ -21,9 +21,93 @@ def main():
     pass
 
 
+@main.command(name="list")
+@click.option(
+    "-n", "--namespace", default="stax", help="A namespace for deployed stack sets"
+)
+def list_stack_sets(namespace):
+    """List all stack sets in the namespace"""
+    cfn = boto3.client("cloudformation")
+    for stack_set in _list_stack_sets(cfn, namespace):
+        click.echo(stack_set["StackSetName"])
+        for instance in _list_stack_set_instances(cfn, stack_set["StackSetName"]):
+            click.echo(f"  {instance['Account']} - {instance['Region']}")
+
+
+def _get_stack_set(cfn, stack_set_name):
+    try:
+        details = cfn.describe_stack_set(CallAs="SELF", StackSetName=stack_set_name)[
+            "StackSet"
+        ]
+        return details
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code")
+        if code != "StackSetNotFoundException":
+            raise
+    raise click.ClickException(f"Stack set not found: {stack_set_name}")
+
+
+def _delete_stack_set(cfn, stack_set_name):
+    details = _get_stack_set(cfn, stack_set_name)
+    if details["OrganizationalUnitIds"]:
+        cfn.delete_stack_instances(
+            StackSetName=stack_set_name,
+            DeploymentTargets={
+                "OrganizationalUnitIds": details["OrganizationalUnitIds"],
+            },
+            Regions=details["Regions"],
+            RetainStacks=False,
+            CallAs="SELF",
+        )
+
+    attempt = 0
+    success = False
+    while attempt < 30 and not success:
+        try:
+            cfn.delete_stack_set(StackSetName=stack_set_name, CallAs="SELF")
+            success = True
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code != "OperationInProgressException":
+                raise
+            attempt += 1
+            click.echo("Waiting for stack set operation to complete...")
+            time.sleep(10)
+    if not success:
+        raise click.ClickException(
+            "Timed out waiting for stack set operation to complete - stacks not updated"
+        )
+
+
+def _list_stack_sets(cfn, namespace):
+    result = []
+    paginator = cfn.get_paginator("list_stack_sets")
+    for page in paginator.paginate(CallAs="SELF", Status="ACTIVE"):
+        for stack_set in page["Summaries"]:
+            details = _get_stack_set(cfn, stack_set["StackSetName"])
+            if details.get("Tags"):
+                for tag in details["Tags"]:
+                    if tag["Key"] == "stax:namespace" and tag["Value"] == namespace:
+                        result.append(stack_set)
+    return result
+
+
+def _list_stack_set_instances(cfn, stack_set_name):
+    paginator = cfn.get_paginator("list_stack_instances")
+    for page in paginator.paginate(StackSetName=stack_set_name, CallAs="SELF"):
+        yield from page["Summaries"]
+
+
+@main.command(name="delete")
+@click.argument("stack_set_name")
+def delete_stack_set(stack_set_name):
+    cfn = boto3.client("cloudformation")
+    _delete_stack_set(cfn, stack_set_name)
+
+
 @main.command()
 @click.option(
-    "-p", "--prefix", default="stax", help="A prefix to add to all stack names"
+    "-n", "--namespace", default="stax", help="A namespace for deployed stack sets"
 )
 @click.option(
     "-s",
@@ -38,7 +122,7 @@ def main():
 )
 @click.option("-r", "--oidc-issuer", default=None, help="OIDC issuer to verify against")
 @click.argument("archive", required=True, type=click.Path(exists=True))
-def deploy(archive, prefix, sigstore_bundle, oidc_identity, oidc_issuer):
+def deploy(archive, namespace, sigstore_bundle, oidc_identity, oidc_issuer):
     """Deploy the archive"""
     archive_path = Path(archive)
 
@@ -91,12 +175,20 @@ def deploy(archive, prefix, sigstore_bundle, oidc_identity, oidc_issuer):
                 raise click.ClickException("No templates found")
         else:
             raise click.ClickException("No templates found")
-
         cfn = boto3.client("cloudformation")
         for resource in manifest.resources:
             if resource.deploy_method == DeployMethod.STACK_SET:
                 # Only handle stack sets for now
-                _deploy_stack_set(cfn, tmp_path, manifest.region, resource, prefix)
+                _deploy_stack_set(cfn, tmp_path, manifest.region, resource, namespace)
+
+        # delete orphaned stack sets
+        stack_sets = _list_stack_sets(cfn, namespace)
+        for stack_set in stack_sets:
+            if stack_set["StackSetName"] not in [
+                f"{namespace}-{resource.name}" for resource in manifest.resources
+            ]:
+                click.echo(f"Deleting orphaned stack set {stack_set['StackSetName']}")
+                _delete_stack_set(cfn, stack_set["StackSetName"])
 
 
 if __name__ == "__main__":
@@ -134,9 +226,9 @@ def _deploy_stack_set(
     bundle_root: Path,
     default_region: str,
     resource,
-    prefix: str,
+    namespace: str,
 ) -> None:
-    stack_set_name = f"{prefix}-{resource.name}"
+    stack_set_name = f"{namespace}-{resource.name}"
     template_path = bundle_root / resource.resource_file
     if not template_path.exists():
         raise click.ClickException(
@@ -161,7 +253,13 @@ def _deploy_stack_set(
         click.echo(f"Existing stack set found: {stack_set_name} - updating")
         try:
             _update_stack_set(
-                cfn, stack_set_name, template_body, parameters, target_spec, regions
+                cfn,
+                stack_set_name,
+                template_body,
+                parameters,
+                target_spec,
+                regions,
+                namespace,
             )
         except ClientError as exc:
             if (
@@ -177,7 +275,7 @@ def _deploy_stack_set(
 
     else:
         click.echo(f"No existing stack set found: {stack_set_name} - creating")
-        _create_stack_set(cfn, stack_set_name, template_body, parameters)
+        _create_stack_set(cfn, stack_set_name, template_body, parameters, namespace)
 
     click.echo(f"Deploying stack set instances: {stack_set_name}")
     attempt = 0
@@ -218,7 +316,7 @@ def _run_cfn_lint(template_files: list[Path]) -> list[str]:
     return errors
 
 
-def _create_stack_set(cfn, stack_set_name, template_body, parameters):
+def _create_stack_set(cfn, stack_set_name, template_body, parameters, namespace):
     cfn.create_stack_set(
         StackSetName=stack_set_name,
         TemplateBody=template_body,
@@ -227,14 +325,18 @@ def _create_stack_set(cfn, stack_set_name, template_body, parameters):
         PermissionModel="SERVICE_MANAGED",
         AutoDeployment={
             "Enabled": True,
-            "RetainStacksOnAccountRemoval": True,
+            "RetainStacksOnAccountRemoval": False,
         },
         CallAs="SELF",
+        Tags=[
+            {"Key": "stax:created-by", "Value": "stax"},
+            {"Key": "stax:namespace", "Value": namespace},
+        ],
     )
 
 
 def _update_stack_set(
-    cfn, stack_set_name, template_body, parameters, target_spec, regions
+    cfn, stack_set_name, template_body, parameters, target_spec, regions, namespace
 ):
     cfn.update_stack_set(
         StackSetName=stack_set_name,
@@ -249,4 +351,8 @@ def _update_stack_set(
         CallAs="SELF",
         DeploymentTargets=target_spec,
         Regions=regions,
+        Tags=[
+            {"Key": "stax:created-by", "Value": "stax"},
+            {"Key": "stax:namespace", "Value": namespace},
+        ],
     )
