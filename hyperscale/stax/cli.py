@@ -9,6 +9,7 @@ import click
 from botocore.exceptions import ClientError
 from sigstore.errors import VerificationError
 
+from hyperscale.stax.core import create_deployer
 from hyperscale.stax.manifest import DeployMethod
 from hyperscale.stax.manifest import load_manifest_from_path
 from hyperscale.stax.sigstore import verify_bundle_signature
@@ -121,8 +122,28 @@ def delete_stack_set(stack_set_name):
     "-i", "--oidc-identity", default=None, help="OIDC identity to verify against"
 )
 @click.option("-r", "--oidc-issuer", default=None, help="OIDC issuer to verify against")
+@click.option(
+    "-a",
+    "--admin-role-arn",
+    default=None,
+    help="The role ARN for a custom clouformation administrator role",
+)
+@click.option(
+    "-e",
+    "--execution-role-name",
+    default=None,
+    help="The role name for the execution role deployed in each target account",
+)
 @click.argument("archive", required=True, type=click.Path(exists=True))
-def deploy(archive, namespace, sigstore_bundle, oidc_identity, oidc_issuer):
+def deploy(
+    archive,
+    namespace,
+    sigstore_bundle,
+    oidc_identity,
+    oidc_issuer,
+    admin_role_arn,
+    execution_role_name,
+):
     """Deploy the archive"""
     archive_path = Path(archive)
 
@@ -143,6 +164,15 @@ def deploy(archive, namespace, sigstore_bundle, oidc_identity, oidc_issuer):
             param_hint=["sigstore-bundle", "oidc-identity", "oidc-issuer"],
         )
 
+    if any([execution_role_name, admin_role_arn]) and not all(
+        [execution_role_name, admin_role_arn]
+    ):
+        raise click.BadParameter(
+            "must provide both of admin-role-arn and execution-role-name or none of "
+            "them",
+            param_hint=["admin-role-arn", "execution-role-name"],
+        )
+
     if sigstore_bundle:
         try:
             verify_bundle_signature(
@@ -160,7 +190,8 @@ def deploy(archive, namespace, sigstore_bundle, oidc_identity, oidc_issuer):
         if not manifest_path.exists():
             raise click.ClickException("manifest.yaml not found at bundle root")
 
-        manifest = load_manifest_from_path(manifest_path)
+        service_managed_perms = admin_role_arn is None
+        manifest = load_manifest_from_path(manifest_path, service_managed_perms)
 
         templates_dir = tmp_path / "templates"
         if templates_dir.exists() and templates_dir.is_dir():
@@ -175,11 +206,20 @@ def deploy(archive, namespace, sigstore_bundle, oidc_identity, oidc_issuer):
                 raise click.ClickException("No templates found")
         else:
             raise click.ClickException("No templates found")
-        cfn = boto3.client("cloudformation")
+        cfn = boto3.client("cloudformation", region_name=manifest.region)
+
         for resource in manifest.resources:
             if resource.deploy_method == DeployMethod.STACK_SET:
                 # Only handle stack sets for now
-                _deploy_stack_set(cfn, tmp_path, manifest.region, resource, namespace)
+                _deploy_stack_set(
+                    cfn,
+                    tmp_path,
+                    manifest.region,
+                    resource,
+                    namespace,
+                    admin_role_arn,
+                    execution_role_name,
+                )
 
         # delete orphaned stack sets
         stack_sets = _list_stack_sets(cfn, namespace)
@@ -206,27 +246,14 @@ def _stack_set_exists(cfn, stack_set_name):
     return False
 
 
-def _get_target_spec(resource):
-    targets = resource.deployment_targets
-    target_spec = {}
-    if targets.organizational_units:
-        target_spec["OrganizationalUnitIds"] = targets.organizational_units
-    if targets.accounts:
-        # Uggh this API is horrible. Can't just specify accounts, despite what the API
-        # docs say. Need to specify an OU the account ID is in, then use the
-        # INTERSECTION filter type and then specify the account IDs.
-        target_spec["Accounts"] = targets.accounts
-        target_spec["AccountFilterType"] = "INTERSECTION"
-        target_spec["OrganizationalUnitIds"] = targets.organizational_units
-    return target_spec
-
-
 def _deploy_stack_set(
     cfn,
     bundle_root: Path,
     default_region: str,
     resource,
     namespace: str,
+    admin_role_arn: str | None,
+    execution_role_name: str | None,
 ) -> None:
     stack_set_name = f"{namespace}-{resource.name}"
     template_path = bundle_root / resource.resource_file
@@ -246,20 +273,18 @@ def _deploy_stack_set(
         for p in getattr(resource, "parameters", [])
     ]
 
-    target_spec = _get_target_spec(resource)
+    deployer = create_deployer(cfn, admin_role_arn, execution_role_name, namespace)
     regions = resource.regions or [default_region]
 
     if _stack_set_exists(cfn, stack_set_name):
         click.echo(f"Existing stack set found: {stack_set_name} - updating")
         try:
-            _update_stack_set(
-                cfn,
+            deployer.update_stack_set(
                 stack_set_name,
                 template_body,
                 parameters,
-                target_spec,
+                resource.deployment_targets,
                 regions,
-                namespace,
             )
         except ClientError as exc:
             if (
@@ -275,23 +300,15 @@ def _deploy_stack_set(
 
     else:
         click.echo(f"No existing stack set found: {stack_set_name} - creating")
-        _create_stack_set(cfn, stack_set_name, template_body, parameters, namespace)
+        deployer.create_stack_set(stack_set_name, template_body, parameters)
 
     click.echo(f"Deploying stack set instances: {stack_set_name}")
     attempt = 0
     success = False
     while attempt < 30 and not success:
         try:
-            cfn.create_stack_instances(
-                StackSetName=stack_set_name,
-                DeploymentTargets=target_spec,
-                Regions=regions,
-                CallAs="SELF",
-                OperationPreferences={
-                    "FailureTolerancePercentage": 30,
-                    "MaxConcurrentPercentage": 100,
-                    "RegionConcurrencyType": "SEQUENTIAL",
-                },
+            deployer.create_stack_instances(
+                stack_set_name, resource.deployment_targets, regions
             )
             success = True
         except ClientError as exc:
@@ -314,45 +331,3 @@ def _run_cfn_lint(template_files: list[Path]) -> list[str]:
         matches = cfnlint.lint_file(path)
         errors.extend(matches)
     return errors
-
-
-def _create_stack_set(cfn, stack_set_name, template_body, parameters, namespace):
-    cfn.create_stack_set(
-        StackSetName=stack_set_name,
-        TemplateBody=template_body,
-        Parameters=parameters,
-        Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"],
-        PermissionModel="SERVICE_MANAGED",
-        AutoDeployment={
-            "Enabled": True,
-            "RetainStacksOnAccountRemoval": False,
-        },
-        CallAs="SELF",
-        Tags=[
-            {"Key": "stax:created-by", "Value": "stax"},
-            {"Key": "stax:namespace", "Value": namespace},
-        ],
-    )
-
-
-def _update_stack_set(
-    cfn, stack_set_name, template_body, parameters, target_spec, regions, namespace
-):
-    cfn.update_stack_set(
-        StackSetName=stack_set_name,
-        TemplateBody=template_body,
-        Parameters=parameters,
-        Capabilities=["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"],
-        PermissionModel="SERVICE_MANAGED",
-        AutoDeployment={
-            "Enabled": True,
-            "RetainStacksOnAccountRemoval": True,
-        },
-        CallAs="SELF",
-        DeploymentTargets=target_spec,
-        Regions=regions,
-        Tags=[
-            {"Key": "stax:created-by", "Value": "stax"},
-            {"Key": "stax:namespace", "Value": namespace},
-        ],
-    )

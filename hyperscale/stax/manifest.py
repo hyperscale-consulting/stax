@@ -54,13 +54,25 @@ class DeploymentTargets:
     organizational_units: list[str] = field(default_factory=list)
 
     @staticmethod
-    def from_dict(data: dict) -> "DeploymentTargets":
-        # These rules are nasty but blame the AWS API
-        if "organizational_units" not in data:
-            raise ManifestError(
-                "organizational_units must be specified. If you want to target "
-                "specific accounts you still need to list an ou that the account is in."
-            )
+    def from_dict(data: dict, service_managed_perms: bool) -> "DeploymentTargets":
+        if service_managed_perms:
+            # These rules are nasty but blame the AWS API
+            if "organizational_units" not in data:
+                raise ManifestError(
+                    "organizational_units must be specified when using service managed "
+                    "permissions. If you want to target specific accounts you still "
+                    "need to list an ou that the account is in."
+                )
+        else:
+            if "organizational_units" in data:
+                raise ManifestError(
+                    "Cannot specify organizational_units when using self-managed "
+                    "permissions."
+                )
+            if "accounts" not in data:
+                raise ManifestError(
+                    "Must specify accounts when using self-managed permissions."
+                )
 
         raw_accounts = data.get("accounts", [])
         raw_ous = data.get("organizational_units", [])
@@ -98,7 +110,7 @@ class Resource:
     parameters: list[Parameter] = field(default_factory=list)
 
     @staticmethod
-    def from_dict(data: dict) -> "Resource":
+    def from_dict(data: dict, service_managed_perms: bool) -> "Resource":
         required_fields = [
             "name",
             "resource_file",
@@ -114,7 +126,9 @@ class Resource:
         resource_file = data["resource_file"]
         deploy_method = data["deploy_method"]
         regions = data["regions"]
-        deployment_targets = DeploymentTargets.from_dict(data["deployment_targets"])
+        deployment_targets = DeploymentTargets.from_dict(
+            data["deployment_targets"], service_managed_perms
+        )
 
         if not isinstance(name, str):
             raise ManifestError("resource.name must be a string")
@@ -156,7 +170,7 @@ class Manifest:
     resources: list[Resource]
 
     @staticmethod
-    def from_dict(data: dict) -> "Manifest":
+    def from_dict(data: dict, service_managed_perms: bool) -> "Manifest":
         for f in ["region", "version", "resources"]:
             if f not in data:
                 raise ManifestError(f"manifest missing required field '{f}'")
@@ -172,7 +186,9 @@ class Manifest:
         if not isinstance(resources_data, list):
             raise ManifestError("resources must be a list")
 
-        resources = [Resource.from_dict(r) for r in resources_data]
+        resources = [
+            Resource.from_dict(r, service_managed_perms) for r in resources_data
+        ]
         return Manifest(
             region=region,
             version=version,
@@ -180,11 +196,11 @@ class Manifest:
         )
 
 
-def load_manifest_from_path(path: Path) -> Manifest:
+def load_manifest_from_path(path: Path, service_managed_perms: bool) -> Manifest:
     """Load and validate a Manifest from a file path containing YAML.
 
     Raises ManifestError on validation issues.
     """
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
-    return Manifest.from_dict(data)
+    return Manifest.from_dict(data, service_managed_perms)
